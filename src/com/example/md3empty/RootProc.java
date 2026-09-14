@@ -69,16 +69,34 @@ public class RootProc {
         return null;
     }
 
+    private static long parseFirstLong(String s, int fromIndex) {
+        int len = s.length();
+        int i = fromIndex;
+        while (i < len && (s.charAt(i) < '0' || s.charAt(i) > '9')) i++;
+        if (i >= len) return -1;
+        long res = 0;
+        while (i < len && s.charAt(i) >= '0' && s.charAt(i) <= '9') {
+            res = res * 10 + (s.charAt(i) - '0');
+            i++;
+        }
+        return res;
+    }
+
     private static long[] parseMeminfo(String txt) {
         if (txt == null) return null;
         long total = -1, avail = -1;
-        String[] lines = txt.split("\n");
-        for (String ln : lines) {
-            try {
-                if (ln.startsWith("MemTotal:")) total = Long.parseLong(ln.replaceAll("[^0-9]", " ").trim().split("\\s+")[0]);
-                else if (ln.startsWith("MemAvailable:")) avail = Long.parseLong(ln.replaceAll("[^0-9]", " ").trim().split("\\s+")[0]);
-            } catch (Exception ignored) {}
+        int len = txt.length();
+        int start = 0;
+        while (start < len) {
+            int end = txt.indexOf('\n', start);
+            if (end < 0) end = len;
+            if (txt.startsWith("MemTotal:", start)) {
+                total = parseFirstLong(txt, start + 9);
+            } else if (txt.startsWith("MemAvailable:", start)) {
+                avail = parseFirstLong(txt, start + 13);
+            }
             if (total > 0 && avail >= 0) break;
+            start = end + 1;
         }
         if (total <= 0) return null;
         if (avail < 0) avail = 0;
@@ -90,27 +108,58 @@ public class RootProc {
         String out = exec("ps -A -o PID,NAME,RSS,CMDLINE", 8000);
         if (out == null || out.length() < 10) return null;
         List<Row> list = new ArrayList<>(700);
-        String[] lines = out.split("\n");
-        for (int i = 1; i < lines.length; i++) {
-            String ln = lines[i].trim();
-            if (ln.isEmpty()) continue;
-            // PID NAME RSS CMDLINE...
-            String[] t = ln.split("\\s+", 4);
-            if (t.length < 3) continue;
-            try {
-                int pid = Integer.parseInt(t[0]);
-                long rss = Long.parseLong(t[2]);
-                String cmd = t.length >= 4 ? t[3].trim() : (t.length >= 2 ? t[1] : "?");
-                // cmdline вида "com.telegram.messenger" или "/system/bin/init ..." — берём 1й токен
-                int sp = cmd.indexOf(' ');
-                String pkg = sp > 0 ? cmd.substring(0, sp) : cmd;
-                if (pkg.isEmpty()) pkg = t[1];
+        int len = out.length();
+        int start = 0;
+        boolean firstLine = true;
+        while (start < len) {
+            int end = out.indexOf('\n', start);
+            if (end < 0) end = len;
+            if (firstLine) {
+                firstLine = false;
+                start = end + 1;
+                continue;
+            }
+            // Parse line without heavy split
+            int i = start;
+            while (i < end && Character.isWhitespace(out.charAt(i))) i++;
+            if (i < end) {
+                // PID
+                int pStart = i;
+                while (i < end && !Character.isWhitespace(out.charAt(i))) i++;
+                int pid = -1;
+                try { pid = Integer.parseInt(out.substring(pStart, i)); } catch (Exception ignored) {}
+
+                while (i < end && Character.isWhitespace(out.charAt(i))) i++;
+                // NAME
+                int nStart = i;
+                while (i < end && !Character.isWhitespace(out.charAt(i))) i++;
+                String name = (nStart < i) ? out.substring(nStart, i) : "?";
+
+                while (i < end && Character.isWhitespace(out.charAt(i))) i++;
+                // RSS
+                int rStart = i;
+                while (i < end && !Character.isWhitespace(out.charAt(i))) i++;
+                long rss = 0;
+                try { rss = Long.parseLong(out.substring(rStart, i)); } catch (Exception ignored) {}
+
+                while (i < end && Character.isWhitespace(out.charAt(i))) i++;
+                // CMDLINE
+                String pkg = name;
+                if (i < end) {
+                    int cStart = i;
+                    while (i < end && out.charAt(i) != ' ' && out.charAt(i) != '\t' && out.charAt(i) != '\r') i++;
+                    String cmd = out.substring(cStart, i);
+                    if (!cmd.isEmpty()) pkg = cmd;
+                }
                 if (pkg.startsWith("/")) {
                     int sl = pkg.lastIndexOf('/');
-                    pkg = sl >= 0 ? pkg.substring(sl + 1) : pkg;
+                    if (sl >= 0) pkg = pkg.substring(sl + 1);
                 }
-                list.add(new Row(pid, pkg, rss, -1));
-            } catch (Exception ignored) {}
+                if (pid > 0) {
+                    list.add(new Row(pid, pkg, rss, -1));
+                }
+            }
+            start = end + 1;
         }
         Collections.sort(list, (a, b) -> Long.compare(b.rssKb, a.rssKb));
         return list;

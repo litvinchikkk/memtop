@@ -23,9 +23,11 @@ public class MainActivity extends Activity {
     private static final long CACHE_TTL = 90_000;
     private static int page = 0;
 
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> appNameCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ExecutorService backgroundExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
+
     private volatile boolean scanning = false;
     private volatile boolean liveBusy = false;
-    private Thread scanThread = null;
     private ViewFlipper flipper;
     private final Handler memHandler = new Handler(Looper.getMainLooper());
     private final Runnable memTick = new Runnable() {
@@ -43,6 +45,22 @@ public class MainActivity extends Activity {
             procHandler.postDelayed(this, 2500);
         }
     };
+
+    private String getAppLabel(android.content.pm.PackageManager pm, String pkg) {
+        String base = pkg;
+        int ci = base.indexOf(':');
+        if (ci > 0) base = base.substring(0, ci);
+        String cached = appNameCache.get(base);
+        if (cached != null) return cached;
+        String title = pkg;
+        try {
+            android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(base, 0);
+            CharSequence lb = pm.getApplicationLabel(ai);
+            if (lb != null && lb.length() > 0) title = lb.toString();
+        } catch (Exception ignored) {}
+        appNameCache.put(base, title);
+        return title;
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -136,7 +154,7 @@ public class MainActivity extends Activity {
         liveRunning = false;
         memHandler.removeCallbacks(memTick);
         procHandler.removeCallbacks(procTick);
-        if (scanThread != null) try { scanThread.interrupt(); } catch (Exception ignored) {}
+        backgroundExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -157,21 +175,22 @@ public class MainActivity extends Activity {
     }
 
     private void refreshProcsLive() {
-        if (scanning || liveBusy) return;
+        if (scanning || liveBusy || backgroundExecutor.isShutdown()) return;
         liveBusy = true;
-        new Thread(() -> {
+        backgroundExecutor.execute(() -> {
             try {
                 java.util.List<RootProc.Row> rows;
                 try { rows = RootProc.fastScan(); } catch (Exception e) { return; }
-                if (rows == null || rows.isEmpty()) return;
+                if (rows == null || rows.isEmpty() || !liveRunning) return;
                 int lim = Math.min(30, rows.size());
                 java.util.List<RootProc.Row> top = new java.util.ArrayList<>(rows.subList(0, lim));
                 try { RootProc.fillPss(top); } catch (Exception ignored) {}
+                if (!liveRunning) return;
                 runOnUiThread(() -> applyLiveRows(top, rows.size()));
             } finally {
                 liveBusy = false;
             }
-        }).start();
+        });
     }
 
     private void applyLiveRows(java.util.List<RootProc.Row> top, int total) {
@@ -202,28 +221,22 @@ public class MainActivity extends Activity {
                 v.animate().alpha(0f).setDuration(180).withEndAction(() -> list.removeView(v)).start();
             }
         }
+        java.util.List<String[]> fresh = new java.util.ArrayList<>(top.size());
         for (int i = 0; i < top.size(); i++) {
             RootProc.Row r = top.get(i);
             View existing = pidToView.get(r.pid);
             String mem = (r.bestKb() / 1024) + " МБ";
+            String title = getAppLabel(pm, r.pkg);
+            String sub = "PID " + r.pid + " • " + r.pkg;
+            fresh.add(new String[]{String.valueOf(r.pid), title, sub, mem});
             if (existing != null) {
                 TextView memV = (TextView) existing.getTag();
-                if (memV != null) memV.setText(mem);
+                if (memV != null && !mem.equals(memV.getText())) memV.setText(mem);
                 if (list.indexOfChild(existing) != i) {
                     list.removeView(existing);
                     list.addView(existing, Math.min(i, list.getChildCount()));
                 }
             } else {
-                String base = r.pkg;
-                int ci = base.indexOf(':');
-                if (ci > 0) base = base.substring(0, ci);
-                String title = r.pkg;
-                try {
-                    android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(base, 0);
-                    CharSequence lb = pm.getApplicationLabel(ai);
-                    if (lb != null && lb.length() > 0) title = lb.toString();
-                } catch (Exception ignored) {}
-                String sub = "PID " + r.pid + " • " + r.pkg;
                 View row = createProcRow(r.pid, title, sub, mem);
                 int pos = Math.min(i, list.getChildCount());
                 list.addView(row, pos);
@@ -231,19 +244,6 @@ public class MainActivity extends Activity {
             }
         }
         if (cnt != null) cnt.setText(top.size() + " / " + total + " • live");
-        java.util.List<String[]> fresh = new java.util.ArrayList<>();
-        for (RootProc.Row r : top) {
-            String base = r.pkg;
-            int ci = base.indexOf(':');
-            if (ci > 0) base = base.substring(0, ci);
-            String title = r.pkg;
-            try {
-                android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(base, 0);
-                CharSequence lb = pm.getApplicationLabel(ai);
-                if (lb != null && lb.length() > 0) title = lb.toString();
-            } catch (Exception ignored) {}
-            fresh.add(new String[]{String.valueOf(r.pid), title, "PID " + r.pid + " • " + r.pkg, (r.bestKb()/1024)+" МБ"});
-        }
         cachedRows = fresh;
         cachedCount = top.size() + " / " + total + " • live";
         cacheTime = System.currentTimeMillis();
@@ -316,7 +316,7 @@ public class MainActivity extends Activity {
 
         // Фон: рут-скан → стрим по одному с анимацией.
         scanning = true;
-        scanThread = new Thread(() -> {
+        backgroundExecutor.execute(() -> {
             java.util.List<RootProc.Row> rows = null;
             boolean isRoot = false;
             try { rows = RootProc.fastScan(); } catch (Exception ignored) {}
@@ -341,16 +341,7 @@ public class MainActivity extends Activity {
             android.content.pm.PackageManager pm = getPackageManager();
             for (int i = 0; i < lim && scanning; i++) {
                 RootProc.Row r = fRows.get(i);
-                String base = r.pkg;
-                int ci = base.indexOf(':');
-                if (ci > 0) base = base.substring(0, ci);
-                String title = r.pkg;
-                try {
-                    android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(base, 0);
-                    CharSequence lb = pm.getApplicationLabel(ai);
-                    if (lb != null && lb.length() > 0) title = lb.toString();
-                } catch (Exception ignored) {}
-                final String fTitle = title;
+                final String fTitle = getAppLabel(pm, r.pkg);
                 final String fPkg = r.pkg;
                 final int fPid = r.pid;
                 final String fMem = (r.rssKb / 1024) + " МБ";
