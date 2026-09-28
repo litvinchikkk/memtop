@@ -24,22 +24,76 @@ public class RootProc {
         public String flat() { return pid + "|" + pkg + "|" + rssKb + "|" + pssKb; }
     }
 
+    // The caller owns the deadline; the worker may block in process startup, read or waitFor.
     private static String exec(String cmd, long timeoutMs) {
-        try {
-            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-            StringBuilder sb = new StringBuilder(1 << 16);
-            BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            char[] buf = new char[8192];
-            long end = System.currentTimeMillis() + timeoutMs;
-            int n;
-            while ((n = br.read(buf)) > 0) {
-                sb.append(buf, 0, n);
-                if (System.currentTimeMillis() > end) break;
+        final class Run implements Runnable {
+            private Process process;
+            private volatile boolean cancelled;
+            private String output;
+
+            synchronized void cancel() {
+                cancelled = true;
+                if (process != null) process.destroy();
             }
-            try { p.waitFor(); } catch (Exception ignored) {}
-            try { p.destroy(); } catch (Exception ignored) {}
-            return sb.toString();
-        } catch (Exception e) {
+
+            @Override public void run() {
+                Process p = null;
+                try {
+                    p = new ProcessBuilder("su", "-c", cmd).start();
+                    synchronized (this) {
+                        process = p;
+                        if (cancelled) {
+                            p.destroy();
+                            return;
+                        }
+                    }
+                    // stderr must be drained independently so it cannot fill its pipe.
+                    final java.io.InputStream err = p.getErrorStream();
+                    Thread errors = new Thread(() -> {
+                        try {
+                            byte[] bytes = new byte[4096];
+                            while (err.read(bytes) != -1) {}
+                        } catch (java.io.IOException ignored) {
+                        } finally {
+                            try { err.close(); } catch (java.io.IOException ignored) {}
+                        }
+                    }, "RootProc-stderr");
+                    errors.setDaemon(true);
+                    errors.start();
+
+                    StringBuilder sb = new StringBuilder(1 << 16);
+                    try (BufferedReader br = new BufferedReader(
+                            new InputStreamReader(p.getInputStream()))) {
+                        char[] buf = new char[8192];
+                        int n;
+                        while ((n = br.read(buf)) != -1) sb.append(buf, 0, n);
+                    }
+                    p.waitFor();
+                    output = sb.toString();
+                } catch (Exception ignored) {
+                } finally {
+                    if (p != null) {
+                        if (cancelled) p.destroy();
+                        try { p.getOutputStream().close(); } catch (java.io.IOException ignored) {}
+                    }
+                }
+            }
+        }
+
+        Run run = new Run();
+        Thread worker = new Thread(run, "RootProc-exec");
+        worker.setDaemon(true);
+        worker.start();
+        try {
+            if (timeoutMs > 0) worker.join(timeoutMs);
+            if (worker.isAlive()) {
+                run.cancel();
+                return null;
+            }
+            return run.output;
+        } catch (InterruptedException e) {
+            run.cancel();
+            Thread.currentThread().interrupt();
             return null;
         }
     }
